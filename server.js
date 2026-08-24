@@ -10,9 +10,9 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-const MONGO_URI = process.env.MONGO_URI ;
-const JWT_SECRET = process.env.JWT_SECRET;
-const PORT = process.env.PORT;
+const MONGO_URI = process.env.MONGO_URI || "mongodb://127.0.0.1:27017/gridfs_rbac_db";
+const JWT_SECRET = process.env.JWT_SECRET || 'fallback_secret_for_development';
+const PORT = process.env.PORT || 5000;
 
 let db, gridBucket;
 
@@ -42,8 +42,6 @@ app.use((req, res, next) => {
 // ==========================================
 const authenticateToken = (req, res, next) => {
   const authHeader = req.headers['authorization'];
-  
-  // FIXED: Reads token from Authorization header OR URL query parameter (?token=...)
   const token = (authHeader && authHeader.split(' ')[1]) || req.query.token;
 
   if (!token) {
@@ -89,7 +87,7 @@ app.post('/api/auth/register', async (req, res) => {
     const newUser = {
       username,
       password: hashedPassword,
-      plainPassword: password, // Retained for Admin dashboard review
+      // REMOVED: plainPassword security leak
       role: assignedRole,
       createdAt: new Date(),
     };
@@ -123,7 +121,7 @@ app.post('/api/auth/login', async (req, res) => {
   }
 });
 
-// Admin: Get all users & credentials
+// Admin: Get all users
 app.get('/api/admin/users', authenticateToken, authorizeRoles('Admin'), async (req, res) => {
   try {
     const users = await db.collection('users')
@@ -138,6 +136,10 @@ app.get('/api/admin/users', authenticateToken, authorizeRoles('Admin'), async (r
 // Admin: Update User Role
 app.patch('/api/admin/users/:id/role', authenticateToken, authorizeRoles('Admin'), async (req, res) => {
   try {
+    if (!ObjectId.isValid(req.params.id)) {
+      return res.status(400).json({ error: 'Invalid user ID format' });
+    }
+
     const { role } = req.body;
     if (!['Admin', 'Teacher', 'Student'].includes(role)) {
       return res.status(400).json({ error: 'Invalid role specified.' });
@@ -151,28 +153,60 @@ app.patch('/api/admin/users/:id/role', authenticateToken, authorizeRoles('Admin'
   }
 });
 
+// Admin: Get Print Reports / Audit Logs
+app.get('/api/admin/print-reports', authenticateToken, authorizeRoles('Admin'), async (req, res) => {
+  try {
+    const reports = await db.collection('print_logs')
+      .find({})
+      .sort({ printedAt: -1 })
+      .toArray();
+      
+    res.json(reports);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // ==========================================
 // GRIDFS FILE ROUTES
 // ==========================================
 
-// Upload Route (Admin & Teacher Only)
+// Upload Route (Admin & Teacher Only) - Fixed Stream Piping & Memory Footprint
 app.post('/api/upload', authenticateToken, authorizeRoles('Admin', 'Teacher'), (req, res) => {
-  const bb = busboy({ headers: req.headers });
+  let bb;
+  try {
+    bb = busboy({ headers: req.headers });
+  } catch (err) {
+    return res.status(400).json({ error: 'Malformed headers or non-multipart request.' });
+  }
+
+  const fields = {};
+  let uploadStream = null;
+  let uploadFinished = false;
+
+  bb.on('field', (fieldname, val) => {
+    fields[fieldname] = val;
+  });
 
   bb.on('file', (fieldname, fileStream, info) => {
     const { filename, mimeType } = info;
 
-    const uploadStream = gridBucket.openUploadStream(filename, {
+    // Directly pipe stream into GridFS to prevent loading file into RAM
+    uploadStream = gridBucket.openUploadStream(filename, {
       metadata: {
         contentType: mimeType,
         uploadedAt: new Date(),
         uploadedBy: req.user.username,
+        userRole: req.user.role,
+        customName: fields.customName || filename,
+        copies: parseInt(fields.copies, 10) || 1,
       },
     });
 
     fileStream.pipe(uploadStream);
 
     uploadStream.on('finish', () => {
+      uploadFinished = true;
       res.status(201).json({
         message: 'File uploaded successfully',
         fileId: uploadStream.id,
@@ -181,18 +215,28 @@ app.post('/api/upload', authenticateToken, authorizeRoles('Admin', 'Teacher'), (
     });
 
     uploadStream.on('error', (err) => {
-      res.status(500).json({ error: err.message });
+      if (!res.headersSent) {
+        res.status(500).json({ error: 'GridFS write error: ' + err.message });
+      }
     });
   });
 
+  bb.on('finish', () => {
+    if (!uploadStream && !res.headersSent) {
+      return res.status(400).json({ error: 'No file provided in request.' });
+    }
+  });
+
   bb.on('error', (err) => {
-    res.status(500).json({ error: 'Multipart parsing failed: ' + err.message });
+    if (!res.headersSent) {
+      res.status(500).json({ error: 'Multipart parsing failed: ' + err.message });
+    }
   });
 
   req.pipe(bb);
 });
 
-// List Files Route (All Authenticated Users)
+// List Files Route
 app.get('/api/files', authenticateToken, async (req, res) => {
   try {
     const files = await gridBucket.find({}).toArray();
@@ -202,18 +246,18 @@ app.get('/api/files', authenticateToken, async (req, res) => {
   }
 });
 
-// Stream/Download Route (Supports Headers OR Query Parameter ?token=...)
+// Stream/Download Route
 app.get('/api/files/:id', authenticateToken, async (req, res) => {
   try {
     if (!ObjectId.isValid(req.params.id)) {
-      return res.status(400).send('Invalid file ID format');
+      return res.status(400).json({ error: 'Invalid file ID format' });
     }
 
     const _id = new ObjectId(req.params.id);
     const files = await gridBucket.find({ _id }).toArray();
 
     if (!files || files.length === 0) {
-      return res.status(404).send('File not found');
+      return res.status(404).json({ error: 'File not found' });
     }
 
     const file = files[0];
@@ -224,11 +268,11 @@ app.get('/api/files/:id', authenticateToken, async (req, res) => {
       res.setHeader('Content-Type', file.metadata.contentType);
     }
 
-    // Handle Range Requests for Media Seeking
     if (range) {
       const parts = range.replace(/bytes=/, '').split('-');
       const start = parseInt(parts[0], 10);
-      const end = parts[1] ? parseInt(parts[1], 10) : fileSize - 1;
+      const endParsed = parseInt(parts[1], 10);
+      const end = !isNaN(endParsed) ? endParsed : fileSize - 1;
       const chunkSize = end - start + 1;
 
       res.writeHead(206, {
@@ -242,42 +286,54 @@ app.get('/api/files/:id', authenticateToken, async (req, res) => {
     } else {
       res.setHeader('Content-Length', fileSize);
       res.setHeader('Accept-Ranges', 'bytes');
-      
+
       const downloadStream = gridBucket.openDownloadStream(_id);
       downloadStream.pipe(res);
     }
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    if (!res.headersSent) {
+      res.status(500).json({ error: err.message });
+    }
   }
 });
 
-// Delete File Route (Admin Only)
+// Delete File Route (Admin Only) - Saves log first, then deletes
 app.delete('/api/files/:id', authenticateToken, authorizeRoles('Admin'), async (req, res) => {
   try {
     if (!ObjectId.isValid(req.params.id)) {
-      return res.status(400).send('Invalid file ID format');
+      return res.status(400).json({ error: 'Invalid file ID format' });
     }
 
     const _id = new ObjectId(req.params.id);
+    const files = await gridBucket.find({ _id }).toArray();
+
+    if (!files || files.length === 0) {
+      return res.status(404).json({ error: 'File not found' });
+    }
+
+    const file = files[0];
+
+    const printLog = {
+      fileId: file._id,
+      filename: file.filename,
+      customName: file.metadata?.customName || file.filename,
+      uploadedBy: file.metadata?.uploadedBy || 'Unknown',
+      userRole: file.metadata?.userRole || 'Teacher',
+      copies: file.metadata?.copies || 1,
+      printedAt: new Date(),
+      printedBy: req.user.username,
+    };
+
+    await db.collection('print_logs').insertOne(printLog);
     await gridBucket.delete(_id);
-    res.json({ message: 'File deleted successfully' });
+
+    res.json({ message: 'File printed/deleted successfully and logged to report.' });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
 
-app.listen(PORT, () => console.log(`Server running on port${PORT}`));
-
-
-
-
-
-
-
-
-
-
-
+app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
 
 
 
@@ -298,8 +354,10 @@ app.listen(PORT, () => console.log(`Server running on port${PORT}`));
 // app.use(cors());
 // app.use(express.json());
 
-// const MONGO_URI = process.env.MONGO_URI || 'mongodb://127.0.0.1:27017/gridfs_rbac_db';
-// const JWT_SECRET = process.env.JWT_SECRET || 'super_secret_jwt_key_123';
+// const MONGO_URI = process.env.MONGO_URI || "mongodb://127.0.0.1:27017/gridfs_rbac_db" ;
+
+// const JWT_SECRET = process.env.JWT_SECRET;
+// const PORT = process.env.PORT;
 
 // let db, gridBucket;
 
@@ -325,41 +383,32 @@ app.listen(PORT, () => console.log(`Server running on port${PORT}`));
 // });
 
 // // ==========================================
-// // AUTHENTICATION MIDDLEWARES
+// // AUTHENTICATION & AUTHORIZATION MIDDLEWARES
 // // ==========================================
-// // const authenticateToken = (req, res, next) => {
-// //   const authHeader = req.headers['authorization'];
-// //   const token = authHeader && authHeader.split(' ')[1];
-// //   if (!token) return res.status(401).json({ error: 'Access denied. No token provided.' });
-
-// //   jwt.verify(token, JWT_SECRET, (err, user) => {
-// //     if (err) return res.status(403).json({ error: 'Invalid or expired token.' });
-// //     req.user = user;
-// //     next();
-// //   });
-// // };
-
-// // const authorizeRoles = (...allowedRoles) => {
-// //   return (req, res, next) => {
-// //     if (!req.user || !allowedRoles.includes(req.user.role)) {
-// //       return res.status(403).json({ error: 'Access denied. Insufficient privileges.' });
-// //     }
-// //     next();
-// //   };
-// // };
-
 // const authenticateToken = (req, res, next) => {
 //   const authHeader = req.headers['authorization'];
-//   // Read token from Header OR Query Parameter
+  
+//   // FIXED: Reads token from Authorization header OR URL query parameter (?token=...)
 //   const token = (authHeader && authHeader.split(' ')[1]) || req.query.token;
 
-//   if (!token) return res.status(401).json({ error: 'Access denied. No token provided.' });
+//   if (!token) {
+//     return res.status(401).json({ error: 'Access denied. No token provided.' });
+//   }
 
 //   jwt.verify(token, JWT_SECRET, (err, user) => {
 //     if (err) return res.status(403).json({ error: 'Invalid or expired token.' });
 //     req.user = user;
 //     next();
 //   });
+// };
+
+// const authorizeRoles = (...allowedRoles) => {
+//   return (req, res, next) => {
+//     if (!req.user || !allowedRoles.includes(req.user.role)) {
+//       return res.status(403).json({ error: 'Access denied. Insufficient privileges.' });
+//     }
+//     next();
+//   };
 // };
 
 // // ==========================================
@@ -385,7 +434,7 @@ app.listen(PORT, () => console.log(`Server running on port${PORT}`));
 //     const newUser = {
 //       username,
 //       password: hashedPassword,
-//       plainPassword: password, // Retained per explicit Admin dashboard requirement
+//       plainPassword: password, // Retained for Admin dashboard review
 //       role: assignedRole,
 //       createdAt: new Date(),
 //     };
@@ -423,7 +472,7 @@ app.listen(PORT, () => console.log(`Server running on port${PORT}`));
 // app.get('/api/admin/users', authenticateToken, authorizeRoles('Admin'), async (req, res) => {
 //   try {
 //     const users = await db.collection('users')
-//       .find({}, { projection: { password: 0 } }) // Omit hashed password, keep plainPassword for Admin display
+//       .find({}, { projection: { password: 0 } })
 //       .toArray();
 //     res.json(users);
 //   } catch (err) {
@@ -498,7 +547,7 @@ app.listen(PORT, () => console.log(`Server running on port${PORT}`));
 //   }
 // });
 
-// // Stream/Download Route (All Authenticated Users - Range Header Support)
+// // Stream/Download Route (Supports Headers OR Query Parameter ?token=...)
 // app.get('/api/files/:id', authenticateToken, async (req, res) => {
 //   try {
 //     if (!ObjectId.isValid(req.params.id)) {
@@ -520,6 +569,7 @@ app.listen(PORT, () => console.log(`Server running on port${PORT}`));
 //       res.setHeader('Content-Type', file.metadata.contentType);
 //     }
 
+//     // Handle Range Requests for Media Seeking
 //     if (range) {
 //       const parts = range.replace(/bytes=/, '').split('-');
 //       const start = parseInt(parts[0], 10);
@@ -561,7 +611,7 @@ app.listen(PORT, () => console.log(`Server running on port${PORT}`));
 //   }
 // });
 
-// app.listen(5000, () => console.log('Server running on port 5000'));
+// app.listen(PORT, () => console.log(`Server running on port${PORT}`));
 
 
 
@@ -571,112 +621,11 @@ app.listen(PORT, () => console.log(`Server running on port${PORT}`));
 
 
 
-// const express = require('express');
-// const { MongoClient, GridFSBucket, ObjectId } = require('mongodb');
-// const multer = require('multer');
-// const cors = require('cors');
-// require('dotenv').config();
 
-// const app = express();
-// app.use(cors());
-// app.use(express.json());
 
-// // Store file in RAM temporarily before piping to MongoDB
-// const upload = multer({ storage: multer.memoryStorage() });
 
-// const MONGO_URI = process.env.MONGO_URI || 'mongodb://localhost:27017/gridfs_demo';
-// let gridBucket;
 
-// MongoClient.connect(MONGO_URI)
-//   .then((client) => {
-//     const db = client.db();
-//     // Initialize GridFS Bucket
-//     gridBucket = new GridFSBucket(db, { bucketName: 'uploads' });
-//     console.log('Connected to MongoDB & GridFSBucket initialized');
-//   })
-//   .catch((err) => console.error(err));
 
-// // ==========================================
-// // 1. UPLOAD FILE ROUTE
-// // ==========================================
-// app.post('/api/upload', upload.single('file'), (req, res) => {
-//   if (!req.file) return res.status(400).send('No file uploaded.');
-    
-//   // Open write stream into GridFS
-//   const uploadStream = gridBucket.openUploadStream(req.file.originalname, {
-//     metadata: {
-//       contentType: req.file.mimetype,
-//       uploadedAt: new Date(),
-//     },
-//   });
-//   console.log('uploaded stream created');
-//   // Write buffer memory to GridFS bucket stream
-//   uploadStream.end(req.file.buffer);
 
-//   uploadStream.on('finish', () => {
-//     res.status(201).json({
-//       message: 'File uploaded successfully',
-//       fileId: uploadStream.id,
-//       filename: req.file.originalname,
-//     });
-//   });
 
-//   uploadStream.on('error', (err) => {
-//     res.status(500).json({ error: err.message });
-//   });
-// });
 
-// // ==========================================
-// // 2. LIST ALL FILES ROUTE
-// // ==========================================
-// app.get('/api/files', async (req, res) => {
-//   try {
-//     const cursor = gridBucket.find({});
-//     const files = await cursor.toArray();
-//     res.json(files);
-//   } catch (err) {
-//     res.status(500).json({ error: err.message });
-//   }
-// });
-
-// // ==========================================
-// // 3. STREAM/DOWNLOAD FILE ROUTE
-// // ==========================================
-// app.get('/api/files/:id', async (req, res) => {
-//   try {
-//     const _id = new ObjectId(req.params.id);
-//     const files = await gridBucket.find({ _id }).toArray();
-
-//     if (!files || files.length === 0) {
-//       return res.status(404).send('File not found');
-//     }
-
-//     const file = files[0];
-    
-//     // Set response headers for audio/video streaming or downloading
-//     if (file.metadata && file.metadata.contentType) {
-//       res.setHeader('Content-Type', file.metadata.contentType);
-//     }
-
-//     // Stream directly from GridFS to HTTP Response stream
-//     const downloadStream = gridBucket.openDownloadStream(_id);
-//     downloadStream.pipe(res);
-//   } catch (err) {
-//     res.status(400).send('Invalid file ID');
-//   }
-// });
-
-// // ==========================================
-// // 4. DELETE FILE ROUTE
-// // ==========================================
-// app.delete('/api/files/:id', async (req, res) => {
-//   try {
-//     const _id = new ObjectId(req.params.id);
-//     await gridBucket.delete(_id);
-//     res.json({ message: 'File deleted successfully' });
-//   } catch (err) {
-//     res.status(500).json({ error: err.message });
-//   }
-// });
-
-// app.listen(3000, () => console.log('Server running on port 5000'));
